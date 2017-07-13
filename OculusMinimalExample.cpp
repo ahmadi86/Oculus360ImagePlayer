@@ -602,11 +602,82 @@ protected:
 #include <oglplus/bound/framebuffer.hpp>
 #include <oglplus/bound/renderbuffer.hpp>
 #include <oglplus/bound/buffer.hpp>
-#include <oglplus/shapes/cube.hpp>
+#include <oglplus/shapes/sphere.hpp>
 #include <oglplus/shapes/wrapper.hpp>
+#include <oglplus/images/image.hpp>
 #pragma warning( default : 4068 4244 4267 4065)
 
+unsigned int gf_get_next_pow2(unsigned int  s)
+{
+	unsigned int  res = 1;
+	while (s > res) {
+		res <<= 1;
+	}
+	return res;
+}
 
+#pragma warning(disable : 4996) 
+oglplus::images::Image* LoadImageFromFile(char *filename)
+{
+	FILE * file;
+	char temp;
+	long i;
+
+	BITMAPINFOHEADER header;
+	unsigned char *data;
+	
+	// Open the file for reading
+	if ((file = fopen(filename, "rb")) == NULL)
+	{
+		printf("Unable to open file.\n");
+		return NULL; 
+	}
+
+	fseek(file, 18, SEEK_CUR);  /* start reading width & height */
+	fread(&header.biWidth, sizeof(int), 1, file);
+	fread(&header.biHeight, sizeof(int), 1, file);
+	fread(&header.biPlanes, sizeof(short int), 1, file);
+	fread(&header.biBitCount, sizeof(unsigned short int), 1, file);
+	
+	fseek(file, 24, SEEK_CUR);
+
+	// Read the data
+	if (header.biWidth<0)
+		header.biWidth = -header.biWidth;
+
+	if (header.biHeight<0) 
+		header.biHeight = -header.biHeight;
+
+	long size = header.biWidth * header.biHeight * 3;
+
+	data = (unsigned char *)malloc(size);
+	if (data == NULL) 
+	{
+		printf("Unable to allocate memory.\n");
+		return NULL;
+	}
+
+	if ((i = fread(data, size, 1, file)) != 1) 
+	{
+		printf("Unable to read from file.\n");
+		return NULL;
+	}
+
+	// Convert BGR to RGB
+	for (i = 0; i< size; i += 3) 
+	{ 
+		temp = data[i];
+		data[i] = data[i + 2];
+		data[i + 2] = temp;
+	}
+
+	fclose(file); // Closes the file stream
+
+	oglplus::images::Image* im = new oglplus::images::Image(header.biWidth, header.biHeight, 1, 3, data);
+
+	return im;
+}
+#pragma warning(default : 4996) 
 
 namespace Attribute {
     enum {
@@ -629,47 +700,51 @@ layout(location = 0) in vec4 Position;
 layout(location = 2) in vec3 Normal;
 layout(location = 5) in mat4 InstanceTransform;
 
+in vec2 TexCoord;
+
 out vec3 vertNormal;
+out vec2 vertTexCoord;
 
 void main(void) {
    mat4 ViewXfm = CameraMatrix * InstanceTransform;
    //mat4 ViewXfm = CameraMatrix;
    vertNormal = Normal;
    gl_Position = ProjectionMatrix * ViewXfm * Position;
+   vertTexCoord = TexCoord;
 }
 )SHADER";
 
 static const char * FRAGMENT_SHADER = R"SHADER(
 #version 410 core
 
+uniform sampler2D TexUnit;
+
 in vec3 vertNormal;
+in vec2 vertTexCoord;
+
 out vec4 fragColor;
 
 void main(void) {
-    vec3 color = vertNormal;
-    if (!all(equal(color, abs(color)))) {
-        color = vec3(1.0) - abs(color);
-    }
-    fragColor = vec4(color, 1.0);
+    vec4 t = texture2D(TexUnit, vertTexCoord);
+    fragColor = vec4(t.rgb, 1.0);
 }
 )SHADER";
 
 // a class for encapsulating building and rendering an RGB cube
-struct ColorCubeScene {
+struct SphereScene {
 
-    // Program
-    oglplus::shapes::ShapeWrapper cube;
-    oglplus::Program prog;
-    oglplus::VertexArray vao;
-    GLuint instanceCount;
-    oglplus::Buffer instances;
+    // Program	
+    oglplus::Program prog;	
 
-    // VBOs for the cube's vertices and normals
-
-    const unsigned int GRID_SIZE { 5 };
-
+	oglplus::shapes::ShapeWrapper sphere;
+	oglplus::VertexArray vaoSphere;
+	GLuint instanceCountSphere;
+	oglplus::Buffer instancesSphere;
+	oglplus::Texture tex;
+	oglplus::images::Image* im;
+	
 public:
-    ColorCubeScene() : cube({ "Position", "Normal" }, oglplus::shapes::Cube()) {
+	SphereScene() : sphere({ "Position", "Normal", "TexCoord" }, oglplus::shapes::Sphere(3.0, 64, 32)) {
         using namespace oglplus;
         try {
             // attach the shaders to the program
@@ -691,37 +766,35 @@ public:
         // link and use it
         prog.Use();
 
-        vao = cube.VAOForProgram(prog);
-        vao.Bind();
-        // Create a cube of cubes
-        {
-            std::vector<mat4> instance_positions;
-            for (unsigned int z = 0; z < GRID_SIZE; ++z) {
-                for (unsigned int y = 0; y < GRID_SIZE; ++y) {
-                    for (unsigned int x = 0; x < GRID_SIZE; ++x) {
-                        int xpos = (x - (GRID_SIZE / 2)) * 2;
-                        int ypos = (y - (GRID_SIZE / 2)) * 2;
-                        int zpos = (z - (GRID_SIZE / 2)) * 2;
-                        vec3 relativePosition = vec3(xpos, ypos, zpos);
-                        if (relativePosition == vec3(0)) {
-                            continue;
-                        }
-                        instance_positions.push_back(glm::translate(glm::mat4(1.0f), relativePosition));
-                    }
-                }
-            }
+		vaoSphere = sphere.VAOForProgram(prog);
+		vaoSphere.Bind();
+		// Create a sphere
+		{
+			std::vector<mat4> instance_positions;
 
-            Context::Bound(Buffer::Target::Array, instances).Data(instance_positions);
-            instanceCount = (GLuint)instance_positions.size();
-            int stride = sizeof(mat4);
-            for (int i = 0; i < 4; ++i) {
-                VertexArrayAttrib instance_attr(prog, Attribute::InstanceTransform + i);
-                size_t offset = sizeof(vec4) * i;
-                instance_attr.Pointer(4, DataType::Float, false, stride, (void*)offset);
-                instance_attr.Divisor(1);
-                instance_attr.Enable();
-            }
-        }
+			vec3 relativePosition = vec3(0, 0, 0);
+			instance_positions.push_back(glm::translate(glm::mat4(1.0f), relativePosition));
+
+			Context::Bound(Buffer::Target::Array, instancesSphere).Data(instance_positions);
+			instanceCountSphere = (GLuint)instance_positions.size();
+			int stride = sizeof(mat4);
+			for (int i = 0; i < 4; ++i) {
+				VertexArrayAttrib instance_attr(prog, Attribute::InstanceTransform + i);
+				size_t offset = sizeof(vec4) * i;
+				instance_attr.Pointer(4, DataType::Float, false, stride, (void*)offset);
+				instance_attr.Divisor(1);
+				instance_attr.Enable();
+			}
+		}
+
+		im = LoadImageFromFile("equirectangular_texture.bmp");
+
+		Context::Bound(Texture::Target::_2D, tex)
+			.Image2D(*im)
+			.MinFilter(TextureMinFilter::Linear)
+			.MagFilter(TextureMagFilter::Linear)
+			.WrapS(TextureWrap::Repeat)
+			.WrapT(TextureWrap::Repeat);
     }
 
     void render(const mat4 & projection, const mat4 & modelview) {
@@ -729,15 +802,21 @@ public:
         prog.Use();
         Uniform<mat4>(prog, "ProjectionMatrix").Set(projection);
         Uniform<mat4>(prog, "CameraMatrix").Set(modelview);
-        vao.Bind();
-        cube.Draw(instanceCount);
+		
+		vaoSphere.Bind();
+		sphere.Draw(instanceCountSphere);
     }
+
+	~SphereScene()	{
+		free(im);
+	}
 };
 
 
 // An example application that renders a simple cube
 class ExampleApp : public RiftApp {
-    std::shared_ptr<ColorCubeScene> cubeScene;
+    std::shared_ptr<SphereScene> cubeScene;
+	
 
 public:
     ExampleApp() { }
@@ -747,8 +826,10 @@ protected:
         RiftApp::initGl();
         glClearColor(0.2f, 0.2f, 0.2f, 0.0f);
         glEnable(GL_DEPTH_TEST);
+		
         ovr_RecenterTrackingOrigin(_session);
-        cubeScene = std::shared_ptr<ColorCubeScene>(new ColorCubeScene());
+				
+        cubeScene = std::shared_ptr<SphereScene>(new SphereScene());
     }
 
     void shutdownGl() override {
